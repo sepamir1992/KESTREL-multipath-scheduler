@@ -98,7 +98,7 @@ class MainActivity : AppCompatActivity() {
     private enum class TestType { MIN_RTT, ROUND_ROBIN, RL_TRAINING }
     private var selectedTestType = TestType.MIN_RTT
 
-    private val SERVER_IP = "34.45.243.172"
+    private val SERVER_IP = "35.225.121.173"
     private val WIFI_PORT = 5000
     private val CELLULAR_PORT = 5001
     private val RL_PORT = 6000
