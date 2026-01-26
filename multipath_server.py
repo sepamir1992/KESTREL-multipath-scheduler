@@ -62,9 +62,9 @@ class MultipathServer:
                         'size': len(chunk_data)
                     }
                 
-                # Calculate RTT (approximate, based on nano timestamp)
-                rtt_ns = time.time_ns() - send_timestamp
-                rtt_ms = rtt_ns / 1_000_000.0
+                # Note: RTT is measured on client side (ACK round-trip)
+                # Server just logs receive time for reference
+                rtt_ms = 0.0  # Actual RTT measured by client
                 
                 # Send ACK back: [chunkId(4)][recvTime(8)]
                 ack_data = struct.pack('!IQ', chunk_id, int(time.time_ns()))
@@ -79,7 +79,7 @@ class MultipathServer:
                     throughput_mbps = (total_bytes * 8) / (elapsed * 1_000_000) if elapsed > 0 else 0
                     
                     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Chunk {chunk_id} from {addr[0]} via {path_name}")
-                    print(f"  RTT: {rtt_ms:.1f}ms | Size: {len(chunk_data)} bytes")
+                    print(f"  Size: {len(chunk_data)} bytes")
                     print(f"  Total: {total_packets} pkts | {total_bytes/1024:.0f} KB | {throughput_mbps:.2f} Mbps")
                     print(f"  WiFi: {self.wifi_packets} pkts ({self.wifi_bytes/1024:.0f} KB)")
                     print(f"  Cell: {self.cellular_packets} pkts ({self.cellular_bytes/1024:.0f} KB)")
