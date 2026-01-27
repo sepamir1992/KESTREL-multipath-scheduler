@@ -47,6 +47,9 @@ ACTION_DIM = 6
 CHECKPOINT_INTERVAL = 10  # Save every N episodes
 MODEL_DIR = "models"
 
+# Training limits
+MAX_EPISODES = 100  # Stop training after this many episodes
+
 # ============================================================================
 # Neural Network Architecture
 # ============================================================================
@@ -371,13 +374,18 @@ class PPOAgent:
 # Reward Functions
 # ============================================================================
 
-def calculate_video_streaming_reward(metrics: Dict) -> float:
+def calculate_video_streaming_reward(metrics: Dict, path_metrics: Optional[Dict] = None) -> float:
     """
     Calculate reward for video streaming intent.
     Prioritizes low delay, low jitter, and stability.
 
+    Uses RELATIVE penalties when path_metrics are available:
+    - Penalizes choosing a path only if it's worse than the alternative
+    - This encourages the agent to learn "choose the better path" rather than "always use WiFi"
+
     Args:
         metrics: Dictionary with p95_delay, p95_jitter, loss_rate, throughput, stall_count
+        path_metrics: Optional dict with 'wifi' and 'cellular' sub-dicts containing per-path metrics
 
     Returns:
         Reward value
@@ -388,13 +396,42 @@ def calculate_video_streaming_reward(metrics: Dict) -> float:
     throughput = metrics.get('throughput', 5)
     stall_count = metrics.get('stall_count', 0)
 
-    reward = (
-        -0.3 * (p95_delay / 100.0)      # Penalize high delay
-        - 0.3 * (p95_jitter / 50.0)     # Penalize jitter (KEY for video!)
-        - 0.2 * (loss_rate * 10.0)      # Penalize packet loss
-        - 0.1 * (stall_count * 5.0)     # Heavily penalize stalls
-        + 0.1 * (throughput / 5.0)      # Small reward for throughput
-    )
+    # Calculate relative penalties if path metrics are available
+    if path_metrics is not None:
+        wifi = path_metrics.get('wifi', {})
+        cellular = path_metrics.get('cellular', {})
+
+        # Get per-path metrics (with defaults)
+        wifi_delay = wifi.get('srtt', 50)
+        wifi_jitter = wifi.get('jitter', 10)
+        cell_delay = cellular.get('srtt', 80)
+        cell_jitter = cellular.get('jitter', 15)
+
+        # Find the best available metrics (minimum delay/jitter)
+        min_delay = min(wifi_delay, cell_delay)
+        min_jitter = min(wifi_jitter, cell_jitter)
+
+        # Relative penalty: how much worse is the actual result compared to the best path?
+        # If we chose optimally, these should be close to 0
+        relative_delay = max(0, p95_delay - min_delay)
+        relative_jitter = max(0, p95_jitter - min_jitter)
+
+        reward = (
+            -0.3 * (relative_delay / 50.0)    # Penalize delay above best path
+            - 0.3 * (relative_jitter / 25.0)  # Penalize jitter above best path
+            - 0.2 * (loss_rate * 10.0)        # Penalize packet loss (absolute)
+            - 0.1 * (stall_count * 5.0)       # Heavily penalize stalls (absolute)
+            + 0.1 * (throughput / 5.0)        # Small reward for throughput
+        )
+    else:
+        # Fallback to absolute penalties if no path metrics available
+        reward = (
+            -0.3 * (p95_delay / 100.0)      # Penalize high delay
+            - 0.3 * (p95_jitter / 50.0)     # Penalize jitter (KEY for video!)
+            - 0.2 * (loss_rate * 10.0)      # Penalize packet loss
+            - 0.1 * (stall_count * 5.0)     # Heavily penalize stalls
+            + 0.1 * (throughput / 5.0)      # Small reward for throughput
+        )
 
     return reward
 
@@ -431,24 +468,25 @@ def calculate_file_transfer_reward(metrics: Dict) -> float:
     return reward
 
 
-def calculate_reward(metrics: Dict, intent: str) -> float:
+def calculate_reward(metrics: Dict, intent: str, path_metrics: Optional[Dict] = None) -> float:
     """
     Calculate reward based on intent type.
 
     Args:
         metrics: QoS metrics from Android
         intent: 'video_streaming' or 'file_transfer'
+        path_metrics: Optional dict with 'wifi' and 'cellular' sub-dicts for relative penalties
 
     Returns:
         Reward value
     """
     if intent == 'video_streaming':
-        return calculate_video_streaming_reward(metrics)
+        return calculate_video_streaming_reward(metrics, path_metrics)
     elif intent == 'file_transfer':
         return calculate_file_transfer_reward(metrics)
     else:
         # Default: weighted average
-        return 0.5 * calculate_video_streaming_reward(metrics) + \
+        return 0.5 * calculate_video_streaming_reward(metrics, path_metrics) + \
                0.5 * calculate_file_transfer_reward(metrics)
 
 
@@ -551,6 +589,7 @@ class RLTrainingServer:
 
         # Recent state/action for reward assignment
         self.last_state = None
+        self.last_state_dict = None  # Raw state dict for relative reward calculation
         self.last_action = None
         self.last_log_prob = None
         self.last_value = None
@@ -579,6 +618,7 @@ class RLTrainingServer:
 
         # Store for later reward assignment
         self.last_state = state
+        self.last_state_dict = state_dict  # Store raw dict for relative reward calculation
         self.last_action = action
         self.last_log_prob = log_prob
         self.last_value = value
@@ -606,8 +646,10 @@ class RLTrainingServer:
         self.wifi_packets += metrics.get('wifi_packets', 0)
         self.cell_packets += metrics.get('cell_packets', 0)
 
-        # Calculate reward
-        reward = calculate_reward(metrics, intent)
+        # Calculate reward with relative penalties for video streaming
+        # Pass path metrics from last state for relative penalty calculation
+        path_metrics = self.last_state_dict if self.last_state_dict else None
+        reward = calculate_reward(metrics, intent, path_metrics)
         self.episode_rewards.append(reward)
         self.episode_steps += 1
 
@@ -701,16 +743,30 @@ class RLTrainingServer:
         self.wifi_packets = 0
         self.cell_packets = 0
         self.last_state = None
+        self.last_state_dict = None
         self.last_action = None
 
         self.agent.episode_count = self.current_episode
+
+        # Check if we've reached MAX_EPISODES
+        training_complete = self.current_episode >= MAX_EPISODES
+        if training_complete:
+            print(f"\n{'='*60}")
+            print(f"TRAINING COMPLETE: Reached {MAX_EPISODES} episodes")
+            print(f"Best avg reward: {self.agent.best_avg_reward:.4f}")
+            print(f"{'='*60}")
+            # Save final model
+            final_path = os.path.join(MODEL_DIR, "kestrel_model_FINAL.pth")
+            self.agent.save(final_path)
+            self.running = False
 
         return {
             'status': 'ok',
             'episode': self.current_episode,
             'total_reward': total_reward,
             'avg_reward': avg_reward,
-            'is_best': is_best
+            'is_best': is_best,
+            'training_complete': training_complete
         }
 
     def handle_client(self, conn: socket.socket, addr: Tuple[str, int]):
