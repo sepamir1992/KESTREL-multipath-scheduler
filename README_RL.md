@@ -187,6 +187,49 @@ Columns:
 
 ## Network Requirements
 
+### Real Network Interface Architecture
+
+The Android client uses **real WiFi and cellular hardware interfaces**, not simulation:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Android Phone                          │
+│                                                             │
+│  ┌──────────────────┐          ┌──────────────────┐        │
+│  │   WiFi Radio     │          │  5G/LTE Radio    │        │
+│  │   (Real HW)      │          │   (Real HW)      │        │
+│  └────────┬─────────┘          └────────┬─────────┘        │
+│           │                             │                   │
+│           ▼                             ▼                   │
+│  ┌──────────────────┐          ┌──────────────────┐        │
+│  │   wifiSocket     │          │  cellularSocket  │        │
+│  │  (UDP, bound to  │          │  (UDP, bound to  │        │
+│  │   WiFi NIC)      │          │   Cellular NIC)  │        │
+│  └────────┬─────────┘          └────────┬─────────┘        │
+│           │                             │                   │
+└───────────┼─────────────────────────────┼───────────────────┘
+            │                             │
+            ▼                             ▼
+     ┌────────────┐                ┌────────────┐
+     │  WiFi AP   │                │ Cell Tower │
+     └──────┬─────┘                └──────┬─────┘
+            │                             │
+            └───────────┬─────────────────┘
+                        ▼
+              ┌───────────────────┐
+              │   Server (VM)     │
+              │  Port 5000 (WiFi) │
+              │  Port 5001 (Cell) │
+              │  Port 6000 (RL)   │
+              └───────────────────┘
+```
+
+**Key Points:**
+- Each socket is bound to a specific network interface using Android's `Network.bindSocket()` API
+- Packets sent via `wifiSocket` traverse the actual WiFi radio
+- Packets sent via `cellularSocket` traverse the actual 5G/LTE radio
+- All metrics (RTT, jitter, loss) are real measurements from actual packet transmissions
+
 ### Server Firewall Rules
 
 Ensure your Google Cloud VM allows inbound traffic on:
