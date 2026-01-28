@@ -41,15 +41,22 @@
             android:id="@+id/roundRobinRadioButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Round Robin"
-            android:layout_marginStart="12dp"/>
+            android:text="RR"
+            android:layout_marginStart="8dp"/>
+
+        <RadioButton
+            android:id="@+id/weightedRRRadioButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="W-RR"
+            android:layout_marginStart="8dp"/>
 
         <RadioButton
             android:id="@+id/rlTrainingRadioButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="RL Training"
-            android:layout_marginStart="12dp"/>
+            android:text="RL"
+            android:layout_marginStart="8dp"/>
     </RadioGroup>
 
     <LinearLayout

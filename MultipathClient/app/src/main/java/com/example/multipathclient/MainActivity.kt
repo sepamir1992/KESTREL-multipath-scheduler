@@ -95,8 +95,14 @@ class MainActivity : AppCompatActivity() {
     private var isRunning = false
     private val gson = Gson()
 
-    private enum class TestType { MIN_RTT, ROUND_ROBIN, RL_TRAINING }
+    private enum class TestType { MIN_RTT, ROUND_ROBIN, WEIGHTED_RR, RL_TRAINING }
     private var selectedTestType = TestType.MIN_RTT
+
+    // Baseline logging
+    private var baselineCsvWriter: BufferedWriter? = null
+    private var baselineEpisode = 0
+    private var baselineStep = 0
+    private var baselineStartTime = 0L
 
     private val SERVER_IP = "34.45.243.172"
     private val WIFI_PORT = 5000
@@ -242,6 +248,7 @@ class MainActivity : AppCompatActivity() {
         testTypeRadioGroup.setOnCheckedChangeListener { _, checkedId ->
             selectedTestType = when (checkedId) {
                 R.id.roundRobinRadioButton -> TestType.ROUND_ROBIN
+                R.id.weightedRRRadioButton -> TestType.WEIGHTED_RR
                 R.id.rlTrainingRadioButton -> TestType.RL_TRAINING
                 else -> TestType.MIN_RTT
             }
@@ -540,8 +547,135 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Weighted Round Robin path selection.
+     * Probabilistically selects path based on inverse RTT.
+     * Lower RTT = higher probability of selection.
+     */
+    private fun selectPathWeightedRR(): Boolean {
+        // Weight inversely proportional to RTT (lower RTT = higher weight)
+        val wifiWeight = 1.0 / (wifiRTT + 1.0)
+        val cellWeight = 1.0 / (cellularRTT + 1.0)
+        val totalWeight = wifiWeight + cellWeight
+        val wifiProbability = wifiWeight / totalWeight
+        return Math.random() < wifiProbability
+    }
+
     // ============================================================
-    // CSV Logging
+    // Baseline CSV Logging (for MinRTT, RR, Weighted RR)
+    // ============================================================
+
+    private fun initializeBaselineCsvLogging() {
+        try {
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val schedulerName = selectedTestType.name.lowercase()
+            val filename = "baseline_${schedulerName}_${timestamp}.csv"
+            val dir = getExternalFilesDir(null)
+            val file = File(dir, filename)
+
+            baselineCsvWriter = BufferedWriter(FileWriter(file))
+            baselineCsvWriter?.write(
+                "timestamp,scheduler,episode,step," +
+                "wifi_srtt,wifi_jitter,wifi_loss,wifi_throughput," +
+                "cell_srtt,cell_jitter,cell_loss,cell_throughput," +
+                "selected_path,wifi_packets,cell_packets," +
+                "p95_delay,p95_jitter,loss_rate,throughput,simulated_reward\n"
+            )
+
+            baselineEpisode = 1
+            baselineStep = 0
+            baselineStartTime = System.currentTimeMillis()
+
+            Log.d("Baseline", "CSV logging initialized: ${file.absolutePath}")
+        } catch (e: Exception) {
+            Log.e("Baseline", "Failed to initialize CSV logging: ${e.message}")
+        }
+    }
+
+    private fun logBaselineStep(
+        selectedPath: String,
+        wifiPackets: Int,
+        cellPackets: Int,
+        p95Delay: Double,
+        p95Jitter: Double,
+        lossRate: Double,
+        throughput: Double
+    ) {
+        try {
+            baselineStep++
+            val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", Locale.US).format(Date())
+            val schedulerName = selectedTestType.name.lowercase()
+
+            // Calculate simulated reward (what RL would have gotten)
+            val simulatedReward = calculateSimulatedReward(
+                p95Delay, p95Jitter, lossRate, throughput,
+                wifiRTT, wifiJitter, cellularRTT, cellularJitter
+            )
+
+            val line = "$timestamp,$schedulerName,$baselineEpisode,$baselineStep," +
+                "${"%.2f".format(wifiRTT)},${"%.2f".format(wifiJitter)},${"%.4f".format(wifiLoss)},${"%.2f".format(wifiThroughput)}," +
+                "${"%.2f".format(cellularRTT)},${"%.2f".format(cellularJitter)},${"%.4f".format(cellularLoss)},${"%.2f".format(cellularThroughput)}," +
+                "$selectedPath,$wifiPackets,$cellPackets," +
+                "${"%.2f".format(p95Delay)},${"%.2f".format(p95Jitter)},${"%.4f".format(lossRate)},${"%.2f".format(throughput)},${"%.4f".format(simulatedReward)}\n"
+
+            baselineCsvWriter?.write(line)
+            baselineCsvWriter?.flush()
+        } catch (e: Exception) {
+            Log.e("Baseline", "Failed to log step: ${e.message}")
+        }
+    }
+
+    /**
+     * Calculate what reward the RL agent would have received for these metrics.
+     * Uses V3 hybrid reward function for fair comparison.
+     */
+    private fun calculateSimulatedReward(
+        p95Delay: Double,
+        p95Jitter: Double,
+        lossRate: Double,
+        throughput: Double,
+        wifiDelay: Double,
+        wifiJitter: Double,
+        cellDelay: Double,
+        cellJitter: Double
+    ): Double {
+        // ABSOLUTE COMPONENT (40%)
+        val absoluteReward = (
+            -0.12 * (p95Delay / 100.0) +
+            -0.12 * (p95Jitter / 50.0) +
+            0.08 * (throughput / 10.0) +
+            0.08 * max(0.0, 1.0 - lossRate * 20)
+        )
+
+        // RELATIVE COMPONENT (60%)
+        val minDelay = min(wifiDelay, cellDelay)
+        val minJitter = min(wifiJitter, cellJitter)
+        val relativeDelay = max(0.0, p95Delay - minDelay)
+        val relativeJitter = max(0.0, p95Jitter - minJitter)
+
+        val relativeReward = (
+            -0.20 * (relativeDelay / 75.0) +
+            -0.20 * (relativeJitter / 40.0)
+        )
+
+        // FIXED PENALTIES (20%)
+        val fixedPenalties = -0.10 * (lossRate * 10.0)
+
+        return absoluteReward + relativeReward + fixedPenalties
+    }
+
+    private fun closeBaselineCsvLogging() {
+        try {
+            baselineCsvWriter?.close()
+            baselineCsvWriter = null
+            Log.d("Baseline", "CSV logging closed")
+        } catch (e: Exception) {
+            Log.e("Baseline", "Failed to close CSV: ${e.message}")
+        }
+    }
+
+    // ============================================================
+    // CSV Logging (for RL Training)
     // ============================================================
 
     private fun initializeCsvLogging() {
@@ -901,6 +1035,7 @@ class MainActivity : AppCompatActivity() {
                     val useWifi = when (selectedTestType) {
                         TestType.MIN_RTT -> wifiRTT <= cellularRTT
                         TestType.ROUND_ROBIN -> chunkId % 2 == 0
+                        TestType.WEIGHTED_RR -> selectPathWeightedRR()
                         TestType.RL_TRAINING -> true // Should not reach here
                     }
 
