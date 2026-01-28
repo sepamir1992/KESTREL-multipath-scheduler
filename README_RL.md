@@ -103,18 +103,51 @@ Intent (2D one-hot):
 
 ### Reward Functions
 
-**Video Streaming:**
+#### Video Streaming (V3 - Hybrid Approach)
+
+The current reward function uses a **hybrid approach** combining absolute and relative penalties:
+
 ```python
-reward = (
-    -0.3 * (p95_delay / 100.0)      # Penalize high delay
-    -0.3 * (p95_jitter / 50.0)      # Penalize jitter
-    -0.2 * (loss_rate * 10.0)       # Penalize packet loss
-    -0.1 * (stall_count * 5.0)      # Penalize stalls
-    +0.1 * (throughput / 5.0)       # Reward throughput
+# ABSOLUTE COMPONENT (40% weight)
+# Rewards good QoS regardless of path chosen
+absolute_reward = (
+    -0.12 * (p95_delay / 100.0)       # Absolute delay penalty (12%)
+    - 0.12 * (p95_jitter / 50.0)      # Absolute jitter penalty (12%)
+    + 0.08 * (throughput / 10.0)      # Absolute throughput bonus (8%)
+    + 0.08 * max(0, 1.0 - loss_rate * 20)  # Low loss bonus (8%)
 )
+
+# RELATIVE COMPONENT (60% weight)
+# Penalizes choosing worse path when better available
+min_delay = min(wifi_delay, cell_delay)
+min_jitter = min(wifi_jitter, cell_jitter)
+relative_delay = max(0, p95_delay - min_delay)
+relative_jitter = max(0, p95_jitter - min_jitter)
+
+relative_reward = (
+    -0.20 * (relative_delay / 75.0)    # Relative delay penalty (20%)
+    - 0.20 * (relative_jitter / 40.0)  # Relative jitter penalty (20%)
+)
+
+# FIXED PENALTIES (20% weight)
+fixed_penalties = (
+    - 0.10 * (loss_rate * 10.0)       # Loss penalty (10%)
+    - 0.10 * (stall_count * 3.0)      # Stall penalty (10%)
+)
+
+reward = absolute_reward + relative_reward + fixed_penalties
 ```
 
-**File Transfer:**
+**Reward Function Evolution:**
+
+| Version | Approach | Issue |
+|---------|----------|-------|
+| V1 | 100% Absolute | Strong WiFi bias (86% usage) |
+| V2 | 100% Relative | Poor absolute performance |
+| V3 | 40% Abs + 60% Rel | Balanced exploration & performance |
+
+#### File Transfer
+
 ```python
 reward = (
     +0.6 * (throughput / 20.0)      # Maximize throughput
@@ -271,11 +304,87 @@ After ~50-100 episodes:
 
 **Video Streaming Intent:**
 - Higher `weight_delay` and `weight_jitter`
-- Strong `use_wifi` preference (WiFi typically has lower jitter)
+- Balanced path usage (not extreme WiFi bias with V3 reward)
 
 **File Transfer Intent:**
 - Higher `weight_throughput`
 - Path selection based on current throughput
+
+## Baseline Comparison
+
+### Available Schedulers
+
+| Scheduler | Description | Use Case |
+|-----------|-------------|----------|
+| **MinRTT** | Always choose path with lowest RTT | Simple baseline |
+| **Round Robin** | Alternate between WiFi and Cellular | Load balancing baseline |
+| **Weighted RR** | Probabilistic selection based on inverse RTT | Adaptive baseline |
+| **RL (KESTREL)** | Learned policy from PPO training | Experimental |
+
+### Running Comparisons
+
+```bash
+# After training, analyze results
+python compare_schedulers.py --rl-log models/training_log.json
+
+# Generate comparison report
+python compare_schedulers.py --rl-log models/training_log.json --output report.txt
+```
+
+### Comparison Metrics
+
+The comparison tool evaluates:
+
+| Metric | Description | RL Must Beat Baseline By |
+|--------|-------------|--------------------------|
+| Mean Reward | Average episode reward | >20% for deployment |
+| P95 Delay | 95th percentile latency | Must be equal or better |
+| Throughput | Data rate achieved | Must be equal or better |
+| Stability | Reward variance | Must be equal or better |
+
+### Validation Criteria
+
+```
+IF RL beats MinRTT by >20% AND beats WRR by >15%:
+    → Ready for production deployment
+
+IF RL beats baselines by 10-20%:
+    → Continue training, need more episodes
+
+IF RL performs within ±10% of baselines:
+    → Use MinRTT (simpler, no training needed)
+
+IF RL performs worse than baselines:
+    → Review reward function and state representation
+```
+
+## Training Configuration
+
+### Current Settings
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Max Episodes | 500 | Increased for convergence |
+| Checkpoint Interval | 10 episodes | Regular model saves |
+| Episode Duration | 60 seconds | Per-episode time |
+| Packets per Step | 10 | Action frequency |
+
+### Convergence Monitoring
+
+Training is considered converged when:
+- Rolling 50-episode average changes < 2%
+- Reward variance decreases over time
+- WiFi usage stabilizes (not oscillating wildly)
+
+## Documentation
+
+Additional documentation available in `docs/`:
+
+| Document | Description |
+|----------|-------------|
+| `ROADMAP_RL_VALIDATION.md` | Complete validation roadmap and next steps |
+| `training_analysis_video_streaming_v1.md` | Analysis of V1 (absolute) training run |
+| `training_analysis_video_streaming_v2_new_reward.md` | Analysis of V2 (relative) training run |
 
 ## References
 

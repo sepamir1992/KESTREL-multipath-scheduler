@@ -48,7 +48,7 @@ CHECKPOINT_INTERVAL = 10  # Save every N episodes
 MODEL_DIR = "models"
 
 # Training limits
-MAX_EPISODES = 100  # Stop training after this many episodes
+MAX_EPISODES = 500  # Stop training after this many episodes (increased for convergence)
 
 # ============================================================================
 # Neural Network Architecture
@@ -376,19 +376,22 @@ class PPOAgent:
 
 def calculate_video_streaming_reward(metrics: Dict, path_metrics: Optional[Dict] = None) -> float:
     """
-    Calculate reward for video streaming intent.
-    Prioritizes low delay, low jitter, and stability.
+    Calculate reward for video streaming intent using HYBRID approach (V3).
 
-    Uses RELATIVE penalties when path_metrics are available:
-    - Penalizes choosing a path only if it's worse than the alternative
-    - This encourages the agent to learn "choose the better path" rather than "always use WiFi"
+    Combines:
+    - 40% ABSOLUTE penalties: Rewards good absolute QoS regardless of path
+    - 60% RELATIVE penalties: Penalizes choosing worse path when better available
+
+    This balances:
+    - Exploration (relative component allows trying both paths)
+    - Performance (absolute component ensures good QoS is rewarded)
 
     Args:
         metrics: Dictionary with p95_delay, p95_jitter, loss_rate, throughput, stall_count
         path_metrics: Optional dict with 'wifi' and 'cellular' sub-dicts containing per-path metrics
 
     Returns:
-        Reward value
+        Reward value (typically in range -1.0 to 0.5)
     """
     p95_delay = metrics.get('p95_delay', 100)
     p95_jitter = metrics.get('p95_jitter', 20)
@@ -396,7 +399,23 @@ def calculate_video_streaming_reward(metrics: Dict, path_metrics: Optional[Dict]
     throughput = metrics.get('throughput', 5)
     stall_count = metrics.get('stall_count', 0)
 
-    # Calculate relative penalties if path metrics are available
+    # =========================================================================
+    # ABSOLUTE COMPONENT (40% weight)
+    # Rewards good absolute performance regardless of which path was chosen
+    # =========================================================================
+    absolute_reward = (
+        -0.12 * (p95_delay / 100.0)       # Absolute delay penalty (12%)
+        - 0.12 * (p95_jitter / 50.0)      # Absolute jitter penalty (12%)
+        + 0.08 * (throughput / 10.0)      # Absolute throughput bonus (8%)
+        + 0.08 * max(0, 1.0 - loss_rate * 20)  # Bonus for low loss (8%)
+    )
+
+    # =========================================================================
+    # RELATIVE COMPONENT (60% weight)
+    # Penalizes choosing a worse path when a better one was available
+    # Uses softer normalization to allow more exploration
+    # =========================================================================
+    relative_reward = 0.0
     if path_metrics is not None:
         wifi = path_metrics.get('wifi', {})
         cellular = path_metrics.get('cellular', {})
@@ -411,29 +430,26 @@ def calculate_video_streaming_reward(metrics: Dict, path_metrics: Optional[Dict]
         min_delay = min(wifi_delay, cell_delay)
         min_jitter = min(wifi_jitter, cell_jitter)
 
-        # Relative penalty: how much worse is the actual result compared to the best path?
-        # If we chose optimally, these should be close to 0
+        # Relative penalty: how much worse is the actual result compared to best path?
+        # Softer normalization (75ms delay, 40ms jitter) than V2 (50ms, 25ms)
         relative_delay = max(0, p95_delay - min_delay)
         relative_jitter = max(0, p95_jitter - min_jitter)
 
-        reward = (
-            -0.3 * (relative_delay / 50.0)    # Penalize delay above best path
-            - 0.3 * (relative_jitter / 25.0)  # Penalize jitter above best path
-            - 0.2 * (loss_rate * 10.0)        # Penalize packet loss (absolute)
-            - 0.1 * (stall_count * 5.0)       # Heavily penalize stalls (absolute)
-            + 0.1 * (throughput / 5.0)        # Small reward for throughput
-        )
-    else:
-        # Fallback to absolute penalties if no path metrics available
-        reward = (
-            -0.3 * (p95_delay / 100.0)      # Penalize high delay
-            - 0.3 * (p95_jitter / 50.0)     # Penalize jitter (KEY for video!)
-            - 0.2 * (loss_rate * 10.0)      # Penalize packet loss
-            - 0.1 * (stall_count * 5.0)     # Heavily penalize stalls
-            + 0.1 * (throughput / 5.0)      # Small reward for throughput
+        relative_reward = (
+            -0.20 * (relative_delay / 75.0)    # Relative delay penalty (20%)
+            - 0.20 * (relative_jitter / 40.0)  # Relative jitter penalty (20%)
         )
 
-    return reward
+    # =========================================================================
+    # FIXED PENALTIES (20% weight)
+    # These are always absolute as they relate to user experience directly
+    # =========================================================================
+    fixed_penalties = (
+        - 0.10 * (loss_rate * 10.0)       # Loss penalty (10%)
+        - 0.10 * (stall_count * 3.0)      # Stall penalty (10%) - reduced from 5.0
+    )
+
+    return absolute_reward + relative_reward + fixed_penalties
 
 
 def calculate_file_transfer_reward(metrics: Dict) -> float:
