@@ -46,6 +46,7 @@ ACTION_DIM = 6
 # Model saving
 CHECKPOINT_INTERVAL = 10  # Save every N episodes
 MODEL_DIR = "models"
+BASELINE_DIR = "baseline_results"  # Directory for baseline scheduler results
 
 # Training limits
 MAX_EPISODES = 500  # Stop training after this many episodes (increased for convergence)
@@ -507,6 +508,136 @@ def calculate_reward(metrics: Dict, intent: str, path_metrics: Optional[Dict] = 
 
 
 # ============================================================================
+# Baseline Logging
+# ============================================================================
+
+class BaselineLogger:
+    """
+    Logs results from baseline schedulers (MinRTT, RR, Weighted RR) for comparison.
+    """
+
+    def __init__(self):
+        self.csv_file = None
+        self.csv_writer = None
+        self.current_scheduler = None
+        self.episode = 0
+        self.step = 0
+        os.makedirs(BASELINE_DIR, exist_ok=True)
+
+    def start_session(self, scheduler: str) -> str:
+        """Start a new baseline logging session."""
+        self.current_scheduler = scheduler
+        self.episode = 1
+        self.step = 0
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"baseline_{scheduler}_{timestamp}.csv"
+        filepath = os.path.join(BASELINE_DIR, filename)
+
+        self.csv_file = open(filepath, 'w')
+        self.csv_file.write(
+            "timestamp,scheduler,episode,step,"
+            "wifi_srtt,wifi_jitter,wifi_loss,wifi_throughput,"
+            "cell_srtt,cell_jitter,cell_loss,cell_throughput,"
+            "selected_path,wifi_packets,cell_packets,"
+            "p95_delay,p95_jitter,loss_rate,throughput,simulated_reward\n"
+        )
+
+        print(f"Baseline logging started: {filepath}")
+        return filepath
+
+    def log_step(self, data: Dict) -> float:
+        """Log a single step and return simulated reward."""
+        if self.csv_file is None:
+            return 0.0
+
+        self.step += 1
+
+        # Extract metrics
+        wifi_srtt = data.get('wifi_srtt', 50)
+        wifi_jitter = data.get('wifi_jitter', 10)
+        wifi_loss = data.get('wifi_loss', 0)
+        wifi_throughput = data.get('wifi_throughput', 0)
+        cell_srtt = data.get('cell_srtt', 80)
+        cell_jitter = data.get('cell_jitter', 15)
+        cell_loss = data.get('cell_loss', 0)
+        cell_throughput = data.get('cell_throughput', 0)
+        selected_path = data.get('selected_path', 'wifi')
+        wifi_packets = data.get('wifi_packets', 0)
+        cell_packets = data.get('cell_packets', 0)
+        p95_delay = data.get('p95_delay', 50)
+        p95_jitter = data.get('p95_jitter', 10)
+        loss_rate = data.get('loss_rate', 0)
+        throughput = data.get('throughput', 0)
+
+        # Calculate simulated reward (V3 hybrid formula)
+        simulated_reward = self._calculate_simulated_reward(
+            p95_delay, p95_jitter, loss_rate, throughput,
+            wifi_srtt, wifi_jitter, cell_srtt, cell_jitter
+        )
+
+        # Write to CSV
+        timestamp = datetime.now().isoformat()
+        line = (
+            f"{timestamp},{self.current_scheduler},{self.episode},{self.step},"
+            f"{wifi_srtt:.2f},{wifi_jitter:.2f},{wifi_loss:.4f},{wifi_throughput:.2f},"
+            f"{cell_srtt:.2f},{cell_jitter:.2f},{cell_loss:.4f},{cell_throughput:.2f},"
+            f"{selected_path},{wifi_packets},{cell_packets},"
+            f"{p95_delay:.2f},{p95_jitter:.2f},{loss_rate:.4f},{throughput:.2f},{simulated_reward:.4f}\n"
+        )
+        self.csv_file.write(line)
+        self.csv_file.flush()
+
+        return simulated_reward
+
+    def _calculate_simulated_reward(
+        self, p95_delay: float, p95_jitter: float, loss_rate: float, throughput: float,
+        wifi_delay: float, wifi_jitter: float, cell_delay: float, cell_jitter: float
+    ) -> float:
+        """Calculate what RL would have received (V3 hybrid formula)."""
+        # ABSOLUTE COMPONENT (40%)
+        absolute_reward = (
+            -0.12 * (p95_delay / 100.0)
+            - 0.12 * (p95_jitter / 50.0)
+            + 0.08 * (throughput / 10.0)
+            + 0.08 * max(0.0, 1.0 - loss_rate * 20)
+        )
+
+        # RELATIVE COMPONENT (60%)
+        min_delay = min(wifi_delay, cell_delay)
+        min_jitter = min(wifi_jitter, cell_jitter)
+        relative_delay = max(0, p95_delay - min_delay)
+        relative_jitter = max(0, p95_jitter - min_jitter)
+
+        relative_reward = (
+            -0.20 * (relative_delay / 75.0)
+            - 0.20 * (relative_jitter / 40.0)
+        )
+
+        # FIXED PENALTIES (20%)
+        fixed_penalties = -0.10 * (loss_rate * 10.0)
+
+        return absolute_reward + relative_reward + fixed_penalties
+
+    def end_episode(self) -> Dict:
+        """End current episode and return stats."""
+        stats = {
+            'episode': self.episode,
+            'steps': self.step
+        }
+        self.episode += 1
+        self.step = 0
+        return stats
+
+    def close(self):
+        """Close the logging session."""
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            print(f"Baseline logging closed for {self.current_scheduler}")
+
+
+# ============================================================================
 # State Processing
 # ============================================================================
 
@@ -609,6 +740,9 @@ class RLTrainingServer:
         self.last_action = None
         self.last_log_prob = None
         self.last_value = None
+
+        # Baseline logging
+        self.baseline_logger = BaselineLogger()
 
         # Ensure model directory exists
         os.makedirs(MODEL_DIR, exist_ok=True)
@@ -785,6 +919,54 @@ class RLTrainingServer:
             'training_complete': training_complete
         }
 
+    def handle_baseline_start(self, data: Dict) -> Dict:
+        """
+        Handle baseline_start request - begin logging for a baseline scheduler.
+
+        Args:
+            data: Request with 'scheduler' field (min_rtt, round_robin, weighted_rr)
+
+        Returns:
+            Response with filepath
+        """
+        scheduler = data.get('scheduler', 'unknown')
+        filepath = self.baseline_logger.start_session(scheduler)
+        return {
+            'status': 'ok',
+            'filepath': filepath,
+            'scheduler': scheduler
+        }
+
+    def handle_baseline_step(self, data: Dict) -> Dict:
+        """
+        Handle baseline_step request - log a single step of baseline data.
+
+        Args:
+            data: Request with step metrics
+
+        Returns:
+            Response with simulated reward
+        """
+        simulated_reward = self.baseline_logger.log_step(data)
+        return {
+            'status': 'ok',
+            'simulated_reward': simulated_reward,
+            'step': self.baseline_logger.step
+        }
+
+    def handle_baseline_end(self, data: Dict) -> Dict:
+        """
+        Handle baseline_end request - close the baseline logging session.
+
+        Returns:
+            Response with session stats
+        """
+        self.baseline_logger.close()
+        return {
+            'status': 'ok',
+            'message': 'Baseline logging session closed'
+        }
+
     def handle_client(self, conn: socket.socket, addr: Tuple[str, int]):
         """
         Handle a connected client.
@@ -823,6 +1005,12 @@ class RLTrainingServer:
                             response = self.handle_report_reward(request)
                         elif msg_type == 'episode_done':
                             response = self.handle_episode_done(request)
+                        elif msg_type == 'baseline_start':
+                            response = self.handle_baseline_start(request)
+                        elif msg_type == 'baseline_step':
+                            response = self.handle_baseline_step(request)
+                        elif msg_type == 'baseline_end':
+                            response = self.handle_baseline_end(request)
                         else:
                             response = {'error': f'Unknown message type: {msg_type}'}
 

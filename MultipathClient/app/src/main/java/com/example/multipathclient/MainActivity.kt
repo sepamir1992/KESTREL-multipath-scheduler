@@ -98,12 +98,6 @@ class MainActivity : AppCompatActivity() {
     private enum class TestType { MIN_RTT, ROUND_ROBIN, WEIGHTED_RR, RL_TRAINING }
     private var selectedTestType = TestType.MIN_RTT
 
-    // Baseline logging
-    private var baselineCsvWriter: BufferedWriter? = null
-    private var baselineEpisode = 0
-    private var baselineStep = 0
-    private var baselineStartTime = 0L
-
     private val SERVER_IP = "34.45.243.172"
     private val WIFI_PORT = 5000
     private val CELLULAR_PORT = 5001
@@ -562,37 +556,61 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ============================================================
-    // Baseline CSV Logging (for MinRTT, RR, Weighted RR)
+    // Baseline Server Logging (for MinRTT, RR, Weighted RR)
+    // Results saved on server in baseline_results/ directory
     // ============================================================
 
-    private fun initializeBaselineCsvLogging() {
-        try {
-            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val schedulerName = selectedTestType.name.lowercase()
-            val filename = "baseline_${schedulerName}_${timestamp}.csv"
-            val dir = getExternalFilesDir(null)
-            val file = File(dir, filename)
+    data class BaselineStartRequest(
+        val type: String = "baseline_start",
+        val scheduler: String
+    )
 
-            baselineCsvWriter = BufferedWriter(FileWriter(file))
-            baselineCsvWriter?.write(
-                "timestamp,scheduler,episode,step," +
-                "wifi_srtt,wifi_jitter,wifi_loss,wifi_throughput," +
-                "cell_srtt,cell_jitter,cell_loss,cell_throughput," +
-                "selected_path,wifi_packets,cell_packets," +
-                "p95_delay,p95_jitter,loss_rate,throughput,simulated_reward\n"
-            )
+    data class BaselineStepRequest(
+        val type: String = "baseline_step",
+        @SerializedName("wifi_srtt") val wifiSrtt: Double,
+        @SerializedName("wifi_jitter") val wifiJitter: Double,
+        @SerializedName("wifi_loss") val wifiLoss: Double,
+        @SerializedName("wifi_throughput") val wifiThroughput: Double,
+        @SerializedName("cell_srtt") val cellSrtt: Double,
+        @SerializedName("cell_jitter") val cellJitter: Double,
+        @SerializedName("cell_loss") val cellLoss: Double,
+        @SerializedName("cell_throughput") val cellThroughput: Double,
+        @SerializedName("selected_path") val selectedPath: String,
+        @SerializedName("wifi_packets") val wifiPackets: Int,
+        @SerializedName("cell_packets") val cellPackets: Int,
+        @SerializedName("p95_delay") val p95Delay: Double,
+        @SerializedName("p95_jitter") val p95Jitter: Double,
+        @SerializedName("loss_rate") val lossRate: Double,
+        val throughput: Double
+    )
 
-            baselineEpisode = 1
-            baselineStep = 0
-            baselineStartTime = System.currentTimeMillis()
+    data class BaselineEndRequest(
+        val type: String = "baseline_end"
+    )
 
-            Log.d("Baseline", "CSV logging initialized: ${file.absolutePath}")
+    private fun connectToBaselineServer(): Boolean {
+        return try {
+            rlSocket = Socket(SERVER_IP, RL_PORT)
+            rlSocket?.soTimeout = 5000
+            rlReader = BufferedReader(InputStreamReader(rlSocket!!.getInputStream()))
+            rlWriter = PrintWriter(BufferedWriter(OutputStreamWriter(rlSocket!!.getOutputStream())), true)
+            Log.d("Baseline", "Connected to server at $SERVER_IP:$RL_PORT")
+            true
         } catch (e: Exception) {
-            Log.e("Baseline", "Failed to initialize CSV logging: ${e.message}")
+            Log.e("Baseline", "Failed to connect to server: ${e.message}")
+            false
         }
     }
 
-    private fun logBaselineStep(
+    private fun startBaselineLogging(): Boolean {
+        val schedulerName = selectedTestType.name.lowercase()
+        val request = BaselineStartRequest(scheduler = schedulerName)
+        val requestJson = gson.toJson(request)
+        val response = sendRLMessage(requestJson)
+        return response != null && response.contains("ok")
+    }
+
+    private fun logBaselineStepToServer(
         selectedPath: String,
         wifiPackets: Int,
         cellPackets: Int,
@@ -600,77 +618,47 @@ class MainActivity : AppCompatActivity() {
         p95Jitter: Double,
         lossRate: Double,
         throughput: Double
-    ) {
-        try {
-            baselineStep++
-            val timestamp = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS", Locale.US).format(Date())
-            val schedulerName = selectedTestType.name.lowercase()
-
-            // Calculate simulated reward (what RL would have gotten)
-            val simulatedReward = calculateSimulatedReward(
-                p95Delay, p95Jitter, lossRate, throughput,
-                wifiRTT, wifiJitter, cellularRTT, cellularJitter
-            )
-
-            val line = "$timestamp,$schedulerName,$baselineEpisode,$baselineStep," +
-                "${"%.2f".format(wifiRTT)},${"%.2f".format(wifiJitter)},${"%.4f".format(wifiLoss)},${"%.2f".format(wifiThroughput)}," +
-                "${"%.2f".format(cellularRTT)},${"%.2f".format(cellularJitter)},${"%.4f".format(cellularLoss)},${"%.2f".format(cellularThroughput)}," +
-                "$selectedPath,$wifiPackets,$cellPackets," +
-                "${"%.2f".format(p95Delay)},${"%.2f".format(p95Jitter)},${"%.4f".format(lossRate)},${"%.2f".format(throughput)},${"%.4f".format(simulatedReward)}\n"
-
-            baselineCsvWriter?.write(line)
-            baselineCsvWriter?.flush()
-        } catch (e: Exception) {
-            Log.e("Baseline", "Failed to log step: ${e.message}")
-        }
-    }
-
-    /**
-     * Calculate what reward the RL agent would have received for these metrics.
-     * Uses V3 hybrid reward function for fair comparison.
-     */
-    private fun calculateSimulatedReward(
-        p95Delay: Double,
-        p95Jitter: Double,
-        lossRate: Double,
-        throughput: Double,
-        wifiDelay: Double,
-        wifiJitter: Double,
-        cellDelay: Double,
-        cellJitter: Double
     ): Double {
-        // ABSOLUTE COMPONENT (40%)
-        val absoluteReward = (
-            -0.12 * (p95Delay / 100.0) +
-            -0.12 * (p95Jitter / 50.0) +
-            0.08 * (throughput / 10.0) +
-            0.08 * max(0.0, 1.0 - lossRate * 20)
-        )
+        try {
+            val request = BaselineStepRequest(
+                wifiSrtt = wifiRTT,
+                wifiJitter = wifiJitter,
+                wifiLoss = wifiLoss,
+                wifiThroughput = wifiThroughput,
+                cellSrtt = cellularRTT,
+                cellJitter = cellularJitter,
+                cellLoss = cellularLoss,
+                cellThroughput = cellularThroughput,
+                selectedPath = selectedPath,
+                wifiPackets = wifiPackets,
+                cellPackets = cellPackets,
+                p95Delay = p95Delay,
+                p95Jitter = p95Jitter,
+                lossRate = lossRate,
+                throughput = throughput
+            )
+            val requestJson = gson.toJson(request)
+            val responseJson = sendRLMessage(requestJson)
 
-        // RELATIVE COMPONENT (60%)
-        val minDelay = min(wifiDelay, cellDelay)
-        val minJitter = min(wifiJitter, cellJitter)
-        val relativeDelay = max(0.0, p95Delay - minDelay)
-        val relativeJitter = max(0.0, p95Jitter - minJitter)
-
-        val relativeReward = (
-            -0.20 * (relativeDelay / 75.0) +
-            -0.20 * (relativeJitter / 40.0)
-        )
-
-        // FIXED PENALTIES (20%)
-        val fixedPenalties = -0.10 * (lossRate * 10.0)
-
-        return absoluteReward + relativeReward + fixedPenalties
+            if (responseJson != null) {
+                val response = gson.fromJson(responseJson, Map::class.java)
+                return (response["simulated_reward"] as? Double) ?: 0.0
+            }
+        } catch (e: Exception) {
+            Log.e("Baseline", "Failed to log step to server: ${e.message}")
+        }
+        return 0.0
     }
 
-    private fun closeBaselineCsvLogging() {
+    private fun endBaselineLogging() {
         try {
-            baselineCsvWriter?.close()
-            baselineCsvWriter = null
-            Log.d("Baseline", "CSV logging closed")
+            val request = BaselineEndRequest()
+            val requestJson = gson.toJson(request)
+            sendRLMessage(requestJson)
+            disconnectFromRLServer()
+            Log.d("Baseline", "Baseline logging ended")
         } catch (e: Exception) {
-            Log.e("Baseline", "Failed to close CSV: ${e.message}")
+            Log.e("Baseline", "Failed to end baseline logging: ${e.message}")
         }
     }
 
@@ -1001,7 +989,22 @@ class MainActivity : AppCompatActivity() {
         wakeLock.acquire(10 * 60 * 1000L)
 
         thread {
+            var serverLoggingEnabled = false
+
             try {
+                // Connect to server for baseline logging
+                updateStatus("Connecting to server for logging...")
+                if (connectToBaselineServer()) {
+                    serverLoggingEnabled = startBaselineLogging()
+                    if (serverLoggingEnabled) {
+                        updateStatus("Server logging enabled. Starting test...")
+                    } else {
+                        updateStatus("Server logging failed. Running without logging...")
+                    }
+                } else {
+                    updateStatus("Could not connect to server. Running without logging...")
+                }
+
                 wifiSocket = DatagramSocket().apply {
                     wifiNetwork?.bindSocket(this)
                     soTimeout = 2000
@@ -1025,6 +1028,15 @@ class MainActivity : AppCompatActivity() {
                 var cellularBytes = 0L
                 val startTime = System.currentTimeMillis()
 
+                // Step-level tracking for server logging
+                var stepWifi = 0
+                var stepCell = 0
+                var stepStartTime = System.currentTimeMillis()
+                val stepRtts = mutableListOf<Double>()
+                val stepJitters = mutableListOf<Double>()
+                var lastRtt = 0.0
+                var lastPath = "wifi"
+
                 for (chunkId in 0 until totalChunks) {
                     if (!isRunning) break
 
@@ -1042,6 +1054,7 @@ class MainActivity : AppCompatActivity() {
                     val socket = if (useWifi) wifiSocket else cellularSocket
                     val port = if (useWifi) WIFI_PORT else CELLULAR_PORT
                     val pathName = if (useWifi) "WiFi" else "Cellular"
+                    lastPath = if (useWifi) "wifi" else "cellular"
 
                     val packetData = ByteBuffer.allocate(12 + length).apply {
                         putInt(chunkId)
@@ -1055,9 +1068,11 @@ class MainActivity : AppCompatActivity() {
                     if (useWifi) {
                         wifiCount++
                         wifiBytes += length
+                        stepWifi++
                     } else {
                         cellularCount++
                         cellularBytes += length
+                        stepCell++
                     }
 
                     val ackBuffer = ByteArray(12)
@@ -1068,10 +1083,37 @@ class MainActivity : AppCompatActivity() {
                         val recvTime = System.nanoTime()
                         val rtt = (recvTime - sendTime) / 1_000_000.0
 
+                        stepRtts.add(rtt)
+                        if (lastRtt > 0) {
+                            stepJitters.add(abs(rtt - lastRtt))
+                        }
+                        lastRtt = rtt
+
                         if (useWifi) {
                             wifiRTT = 0.875 * wifiRTT + 0.125 * rtt
                         } else {
                             cellularRTT = 0.875 * cellularRTT + 0.125 * rtt
+                        }
+
+                        // Log to server every PACKETS_PER_STEP packets
+                        if (serverLoggingEnabled && (stepWifi + stepCell) >= PACKETS_PER_STEP) {
+                            val stepTime = (System.currentTimeMillis() - stepStartTime) / 1000.0
+                            val p95Delay = if (stepRtts.isNotEmpty()) {
+                                stepRtts.sorted()[(stepRtts.size * 0.95).toInt().coerceIn(0, stepRtts.size - 1)]
+                            } else 0.0
+                            val p95Jitter = if (stepJitters.isNotEmpty()) {
+                                stepJitters.sorted()[(stepJitters.size * 0.95).toInt().coerceIn(0, stepJitters.size - 1)]
+                            } else 0.0
+                            val stepThroughput = if (stepTime > 0) ((stepWifi + stepCell) * CHUNK_SIZE * 8.0) / (stepTime * 1_000_000) else 0.0
+
+                            logBaselineStepToServer(lastPath, stepWifi, stepCell, p95Delay, p95Jitter, 0.0, stepThroughput)
+
+                            // Reset step counters
+                            stepWifi = 0
+                            stepCell = 0
+                            stepStartTime = System.currentTimeMillis()
+                            stepRtts.clear()
+                            stepJitters.clear()
                         }
 
                         if (chunkId % 10 == 0) {
@@ -1081,6 +1123,7 @@ class MainActivity : AppCompatActivity() {
                                 Path: $pathName | RTT: ${rtt.toInt()}ms
                                 WiFi RTT: ${wifiRTT.toInt()}ms | Cell RTT: ${cellularRTT.toInt()}ms
                                 WiFi: $wifiCount pkts | Cell: $cellularCount pkts
+                                ${if (serverLoggingEnabled) "[Logging to server]" else "[No server logging]"}
                             """.trimIndent())
                         }
 
@@ -1103,12 +1146,16 @@ class MainActivity : AppCompatActivity() {
                     Cellular: $cellularCount pkts (${cellularBytes / 1024}KB)
                     Final WiFi RTT: ${wifiRTT.toInt()}ms
                     Final Cell RTT: ${cellularRTT.toInt()}ms
+                    ${if (serverLoggingEnabled) "[Results saved on server]" else ""}
                 """.trimIndent())
 
             } catch (e: Exception) {
                 updateStatus("ERROR: ${e.message}")
                 Log.e("Multipath", "Error in transfer", e)
             } finally {
+                if (serverLoggingEnabled) {
+                    endBaselineLogging()
+                }
                 wifiSocket?.close()
                 cellularSocket?.close()
                 wakeLock.release()
